@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-DATASET="breast_cancer"
+# Ensure we're running from repo root when using Colab:
+# In Colab cell before this script: %cd /content/project && %env PYTHONPATH=/content/project
 
-# Run classical baselines end-to-end on cached splits.
-python baselines/classical.py --dataset "${DATASET}" --algo logreg
-python baselines/classical.py --dataset "${DATASET}" --algo knn --k 5
-python baselines/classical.py --dataset "${DATASET}" --algo gnb
+python baselines/classical.py --algo logreg
+python baselines/classical.py --algo knn --k 5
+python baselines/classical.py --algo gnb

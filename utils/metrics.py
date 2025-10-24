@@ -28,7 +28,7 @@ def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, labels: List[str], ou
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig, ax = plt.subplots(figsize=(7, 6), dpi=120)
-    disp = ConfusionMatrixDisplay.from_predictions(
+    ConfusionMatrixDisplay.from_predictions(
         y_true=y_true, y_pred=y_pred, display_labels=labels, xticks_rotation=45, ax=ax, colorbar=False
     )
     ax.set_title("Confusion Matrix")

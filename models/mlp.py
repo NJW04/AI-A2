@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Configurable MLP classifier for tabular data (Dry Bean)."""
+"""Configurable MLP classifier for tabular data."""
 
 from __future__ import annotations
 from typing import Iterable, List
@@ -49,7 +49,7 @@ def build_mlp(
     dropout: float,
     batchnorm: bool,
 ) -> MLPClassifier:
-    """Factory method used by train/tune scripts."""
+    """Factory method used by train/eval."""
     return MLPClassifier(
         input_dim=input_dim,
         num_classes=num_classes,

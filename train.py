@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Train an MLP on Breast Cancer (default) or Dry Bean with early stopping (val macro-F1).
+Train an MLP on the Breast Cancer dataset with early stopping (val macro-F1).
 
-Artifacts are saved under: artifacts/<DATASET>/<DATESTAMP>/
+Artifacts are saved under: artifacts/breast_cancer/<DATESTAMP>/
 - best.pt (state_dict)
 - best.json (hyperparams + best val metrics)
 - meta.json (feature & class names)
-- scaler.pkl (for tabular datasets)
+- scaler.pkl
 - train_log.csv / val_log.csv
 """
 from __future__ import annotations
@@ -14,7 +14,7 @@ from __future__ import annotations
 import argparse
 import datetime as dt
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import List, Tuple
 
 import joblib
 import numpy as np
@@ -22,28 +22,19 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset
 
+from data.breast_cancer import (
+    BreastCancerMeta,
+    load_breast_cancer_csv,
+    make_splits,
+    save_scaler,
+    standardize,
+)
 from data.transforms import compute_class_weights, to_torch_tensors
 from models.mlp import build_mlp
 from utils.io import project_paths, write_json
 from utils.log import append_csv
 from utils.metrics import compute_metrics
 from utils.seed import set_seed
-
-# Dataset backends
-from data.breast_cancer import (
-    BreastCancerMeta,
-    load_or_fetch_breast_cancer as bc_load,
-    make_splits as bc_splits,
-    save_scaler as bc_save_scaler,
-    standardize as bc_standardize,
-)
-from data.drybean import (
-    DryBeanMeta,
-    load_or_download_drybean as db_load,
-    make_splits as db_splits,
-    save_scaler as db_save_scaler,
-    standardize as db_standardize,
-)
 
 
 def _parse_hidden_sizes(s: str) -> List[int]:
@@ -85,8 +76,8 @@ def _epoch_step(
     return mean_loss, y_true, y_pred
 
 
-def _create_artifacts_dir(dataset: str, user_dir: str | None) -> Path:
-    base = project_paths()["artifacts"] / dataset
+def _create_artifacts_dir(user_dir: str | None) -> Path:
+    base = project_paths()["artifacts"] / "breast_cancer"
     if user_dir:
         adir = Path(user_dir)
     else:
@@ -96,46 +87,11 @@ def _create_artifacts_dir(dataset: str, user_dir: str | None) -> Path:
     return adir
 
 
-def _build_loaders_for_dataset(
-    dataset: str, batch_size: int, seed: int
-):
-    """
-    Returns loaders, meta, csv_path, scaler_cache_path for the chosen dataset.
-    """
-    if dataset == "breast_cancer":
-        csv = bc_load()
-        X_tr, y_tr, X_val, y_val, X_te, y_te, meta = bc_splits(csv, seed=seed)
-        X_tr, X_val, X_te, scaler = bc_standardize(X_tr, X_val, X_te)
-        scaler_path = bc_save_scaler(scaler, csv, seed=seed, val_size=0.15, test_size=0.15)
-    elif dataset == "drybean":
-        csv = db_load()
-        X_tr, y_tr, X_val, y_val, X_te, y_te, meta = db_splits(csv, seed=seed)
-        X_tr, X_val, X_te, scaler = db_standardize(X_tr, X_val, X_te)
-        scaler_path = db_save_scaler(scaler, csv, seed=seed, val_size=0.15, test_size=0.15)
-    else:
-        raise ValueError("Unsupported dataset. Choose from {breast_cancer,drybean}.")
-
-    X_tr_t, y_tr_t = to_torch_tensors(X_tr, y_tr)
-    X_val_t, y_val_t = to_torch_tensors(X_val, y_val)
-    X_te_t, y_te_t = to_torch_tensors(X_te, y_te)
-
-    train_ds = TensorDataset(X_tr_t, y_tr_t)
-    val_ds = TensorDataset(X_val_t, y_val_t)
-    test_ds = TensorDataset(X_te_t, y_te_t)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(test_ds, batch_size=batch_size, shuffle=False, num_workers=0)
-    return train_loader, val_loader, test_loader, meta, Path(csv), Path(scaler_path)
-
-
 def train_main():
     parser = argparse.ArgumentParser(
-        description="Train an MLP on Breast Cancer (default) or Dry Bean with early stopping.",
+        description="Train an MLP on the Breast Cancer dataset with early stopping.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--dataset", choices=["breast_cancer", "drybean"], default="breast_cancer",
-                        help="Dataset to train on.")
     parser.add_argument("--epochs", type=int, default=50, help="Max training epochs.")
     parser.add_argument("--batch-size", type=int, default=64, help="Batch size.")
     parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
@@ -150,25 +106,30 @@ def train_main():
     parser.add_argument("--patience", type=int, default=8, help="Early stopping patience (epochs).")
     parser.add_argument("--seed", type=int, default=42, help="Random seed.")
     parser.add_argument("--artifacts-dir", type=str, default=None,
-                        help="Where to save artifacts (default: artifacts/<DATASET>/<DATESTAMP>).")
+                        help="Where to save artifacts (default: artifacts/breast_cancer/<DATESTAMP>).")
     args = parser.parse_args()
 
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    artifacts = _create_artifacts_dir(args.dataset, args.artifacts_dir)
+    artifacts = _create_artifacts_dir(args.artifacts_dir)
 
     # Data
-    train_loader, val_loader, test_loader, meta, csv_path, scaler_cache_path = _build_loaders_for_dataset(
-        args.dataset, args.batch_size, args.seed
-    )
+    csv_path = load_breast_cancer_csv()
+    X_tr, y_tr, X_val, y_val, X_te, y_te, meta = make_splits(csv_path, seed=args.seed)
+    X_tr, X_val, X_te, scaler = standardize(X_tr, X_val, X_te)
+    scaler_cache_path = save_scaler(scaler, seed=args.seed, val_size=0.15, test_size=0.15)
+
+    X_tr_t, y_tr_t = to_torch_tensors(X_tr, y_tr)
+    X_val_t, y_val_t = to_torch_tensors(X_val, y_val)
+    X_te_t, y_te_t = to_torch_tensors(X_te, y_te)
+
+    train_loader = DataLoader(TensorDataset(X_tr_t, y_tr_t), batch_size=args.batch_size, shuffle=True, num_workers=0)
+    val_loader = DataLoader(TensorDataset(X_val_t, y_val_t), batch_size=args.batch_size, shuffle=False, num_workers=0)
+    test_loader = DataLoader(TensorDataset(X_te_t, y_te_t), batch_size=args.batch_size, shuffle=False, num_workers=0)
+
     input_dim = len(meta.feature_names)
-    # For breast_cancer: 2 classes; for drybean: 7 classes
-    if hasattr(meta, "class_names"):
-        num_classes = len(meta.class_names)  # type: ignore[attr-defined]
-        class_names = meta.class_names       # type: ignore[attr-defined]
-    else:
-        num_classes = int(train_loader.dataset.tensors[1].max().item() + 1)  # type: ignore[attr-defined]
-        class_names = [str(i) for i in range(num_classes)]
+    num_classes = len(meta.class_names)  # 2
+    class_names = meta.class_names
 
     hidden = _parse_hidden_sizes(args.hidden_sizes)
     model = build_mlp(
@@ -180,10 +141,9 @@ def train_main():
     ).to(device)
 
     # Optional class weights
-    y_train = train_loader.dataset.tensors[1].numpy()  # type: ignore[attr-defined]
     weight_tensor = None
     if args.class_weights:
-        cw = compute_class_weights(y_train)
+        cw = compute_class_weights(y_tr)
         weight_tensor = torch.tensor(cw, dtype=torch.float32, device=device)
 
     criterion = nn.CrossEntropyLoss(weight=weight_tensor)
@@ -228,7 +188,6 @@ def train_main():
                     "epoch": epoch,
                     "val": va_metrics,
                     "config": {
-                        "dataset": args.dataset,
                         "epochs": args.epochs,
                         "batch_size": args.batch_size,
                         "lr": args.lr,
@@ -244,12 +203,9 @@ def train_main():
                 },
             )
             # Save meta + scaler for evaluation
-            write_json(artifacts / "meta.json", {"feature_names": getattr(meta, "feature_names", []),
-                                                 "class_names": getattr(meta, "class_names", [])})
+            write_json(artifacts / "meta.json", {"feature_names": meta.feature_names, "class_names": meta.class_names})
             try:
-                sp = Path(scaler_cache_path)
-                if sp.exists():
-                    joblib.dump(joblib.load(sp), artifacts / "scaler.pkl")
+                joblib.dump(joblib.load(scaler_cache_path), artifacts / "scaler.pkl")
             except Exception as e:
                 print(f"[warn] could not copy scaler: {e}")
             no_improve = 0
