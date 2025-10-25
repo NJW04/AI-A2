@@ -1,223 +1,283 @@
-#!/usr/bin/env python3
-"""
-Train an MLP on the Breast Cancer dataset with early stopping (val macro-F1).
-
-Artifacts are saved under: artifacts/breast_cancer/<DATESTAMP>/
-- best.pt (state_dict)
-- best.json (hyperparams + best val metrics)
-- meta.json (feature & class names)
-- scaler.pkl
-- train_log.csv / val_log.csv
-"""
+# train.py
 from __future__ import annotations
 
 import argparse
-import datetime as dt
+import json
+import shutil
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import joblib
 import numpy as np
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader, Dataset, TensorDataset
 
-from data.breast_cancer import (
-    BreastCancerMeta,
-    load_breast_cancer_csv,
+from data.transforms import compute_class_weights, to_tensor
+from data.wine_white import (
+    CLASS_NAMES,
+    load_or_fetch_wine_white,
     make_splits,
-    save_scaler,
     standardize,
 )
-from data.transforms import compute_class_weights, to_torch_tensors
-from models.mlp import build_mlp
-from utils.io import project_paths, write_json
-from utils.log import append_csv
+from models.mlp import MLPClassifier
+from utils.io import default_artifacts_dir, ensure_dir, save_json
+from utils.log import CSVLogger
 from utils.metrics import compute_metrics
 from utils.seed import set_seed
 
 
-def _parse_hidden_sizes(s: str) -> List[int]:
-    return [int(x.strip()) for x in s.split(",") if x.strip()]
+@dataclass
+class TrainConfig:
+    hidden_sizes: List[int] = None
+    dropout: float = 0.2
+    batchnorm: bool = False
+    epochs: int = 50
+    batch_size: int = 64
+    lr: float = 1e-3
+    weight_decay: float = 1e-4
+    patience: int = 8
+    class_weights: bool = False
+    seed: int = 42
+    data_dir: str | None = None
+
+    def finalize(self):
+        if self.hidden_sizes is None:
+            self.hidden_sizes = [256, 256, 256]
 
 
-def _epoch_step(
-    model: torch.nn.Module,
-    loader: DataLoader,
-    criterion: torch.nn.Module,
-    optimizer: torch.optim.Optimizer | None,
-) -> Tuple[float, np.ndarray, np.ndarray]:
-    is_train = optimizer is not None
-    model.train(is_train)
-    device = next(model.parameters()).device
-    running_loss = 0.0
-    n_total = 0
-    ys, yps = [], []
+def _prepare_datasets(
+    data_dir: str | None, seed: int
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict]:
+    df, meta = load_or_fetch_wine_white(data_dir=data_dir)
+    feature_names = meta["feature_names"]
+    splits = make_splits(df, seed=seed, data_dir=data_dir)
 
-    for xb, yb in loader:
-        xb = xb.to(device)
-        yb = yb.to(device)
-        if is_train:
-            optimizer.zero_grad(set_to_none=True)
-        logits = model(xb)
-        loss = criterion(logits, yb)
-        if is_train:
-            loss.backward()
-            optimizer.step()
-        running_loss += loss.item() * yb.size(0)
-        n_total += yb.size(0)
-        yhat = torch.argmax(logits, dim=1)
-        ys.append(yb.detach().cpu().numpy())
-        yps.append(yhat.detach().cpu().numpy())
+    X = df[feature_names].values
+    y = df["label_idx"].values
 
-    mean_loss = running_loss / max(1, n_total)
-    y_true = np.concatenate(ys) if ys else np.array([], dtype=np.int64)
-    y_pred = np.concatenate(yps) if yps else np.array([], dtype=np.int64)
-    return mean_loss, y_true, y_pred
+    X_train = X[splits["train_idx"]]
+    y_train = y[splits["train_idx"]]
+    X_val = X[splits["val_idx"]]
+    y_val = y[splits["val_idx"]]
+    X_test = X[splits["test_idx"]]
+    y_test = y[splits["test_idx"]]
 
-
-def _create_artifacts_dir(user_dir: str | None) -> Path:
-    base = project_paths()["artifacts"] / "breast_cancer"
-    if user_dir:
-        adir = Path(user_dir)
-    else:
-        stamp = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
-        adir = base / stamp
-    adir.mkdir(parents=True, exist_ok=True)
-    return adir
-
-
-def train_main():
-    parser = argparse.ArgumentParser(
-        description="Train an MLP on the Breast Cancer dataset with early stopping.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    X_train_s, X_val_s, X_test_s, scaler = standardize(
+        X_train, X_val, X_test, cache_dir=data_dir
     )
-    parser.add_argument("--epochs", type=int, default=50, help="Max training epochs.")
-    parser.add_argument("--batch-size", type=int, default=64, help="Batch size.")
-    parser.add_argument("--lr", type=float, default=1e-3, help="Adam learning rate.")
-    parser.add_argument("--weight-decay", type=float, default=1e-4, help="L2 weight decay.")
-    parser.add_argument("--hidden-sizes", type=str, default="256,256,256",
-                        help="Comma-separated hidden sizes for the MLP.")
-    parser.add_argument("--dropout", type=float, default=0.2, help="Dropout rate for the MLP.")
-    parser.add_argument("--batchnorm", action="store_true", default=True, help="Use BatchNorm in MLP.")
-    parser.add_argument("--no-batchnorm", action="store_false", dest="batchnorm", help="Disable BatchNorm.")
-    parser.add_argument("--class-weights", action="store_true",
-                        help="Use class weights in CrossEntropy.")
-    parser.add_argument("--patience", type=int, default=8, help="Early stopping patience (epochs).")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed.")
-    parser.add_argument("--artifacts-dir", type=str, default=None,
-                        help="Where to save artifacts (default: artifacts/breast_cancer/<DATESTAMP>).")
-    args = parser.parse_args()
+    return X_train_s, y_train, X_val_s, y_val, X_test_s, y_test, meta
 
-    set_seed(args.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    artifacts = _create_artifacts_dir(args.artifacts_dir)
 
-    # Data
-    csv_path = load_breast_cancer_csv()
-    X_tr, y_tr, X_val, y_val, X_te, y_te, meta = make_splits(csv_path, seed=args.seed)
-    X_tr, X_val, X_te, scaler = standardize(X_tr, X_val, X_te)
-    scaler_cache_path = save_scaler(scaler, seed=args.seed, val_size=0.15, test_size=0.15)
+def _make_loaders(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    X_val: np.ndarray,
+    y_val: np.ndarray,
+    batch_size: int,
+):
+    Xtr_t, ytr_t = to_tensor(X_train, y_train)
+    Xva_t, yva_t = to_tensor(X_val, y_val)
+    ds_tr = TensorDataset(Xtr_t, ytr_t)
+    ds_va = TensorDataset(Xva_t, yva_t)
+    g = torch.Generator()
+    g.manual_seed(0)
+    train_loader = DataLoader(
+        ds_tr, batch_size=batch_size, shuffle=True, num_workers=0, generator=g
+    )
+    val_loader = DataLoader(ds_va, batch_size=batch_size, shuffle=False, num_workers=0)
+    return train_loader, val_loader
 
-    X_tr_t, y_tr_t = to_torch_tensors(X_tr, y_tr)
-    X_val_t, y_val_t = to_torch_tensors(X_val, y_val)
-    X_te_t, y_te_t = to_torch_tensors(X_te, y_te)
 
-    train_loader = DataLoader(TensorDataset(X_tr_t, y_tr_t), batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(TensorDataset(X_val_t, y_val_t), batch_size=args.batch_size, shuffle=False, num_workers=0)
-    test_loader = DataLoader(TensorDataset(X_te_t, y_te_t), batch_size=args.batch_size, shuffle=False, num_workers=0)
+def _evaluate(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> Dict:
+    model.eval()
+    preds, labels = [], []
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            logits = model(xb)
+            pred = torch.argmax(logits, dim=1)
+            preds.append(pred.cpu().numpy())
+            labels.append(yb.cpu().numpy())
+    y_pred = np.concatenate(preds)
+    y_true = np.concatenate(labels)
+    return compute_metrics(y_true, y_pred)
 
-    input_dim = len(meta.feature_names)
-    num_classes = len(meta.class_names)  # 2
-    class_names = meta.class_names
 
-    hidden = _parse_hidden_sizes(args.hidden_sizes)
-    model = build_mlp(
+def run_training(config: TrainConfig, artifacts_dir: Path | None = None) -> Tuple[Dict, Path]:
+    config.finalize()
+    set_seed(config.seed)
+
+    # Prepare data
+    X_train, y_train, X_val, y_val, X_test, y_test, meta = _prepare_datasets(
+        data_dir=config.data_dir, seed=config.seed
+    )
+
+    # Prepare artifacts dir
+    run_dir = artifacts_dir or default_artifacts_dir(
+        "wine_white", tag=f"mlp_seed{config.seed}"
+    )
+    ensure_dir(run_dir)
+    # Copy scaler.pkl from cache to run_dir (if exists)
+    cache_dir = Path(config.data_dir) if config.data_dir else Path(".cache/wine_white")
+    scaler_path = cache_dir / "scaler.pkl"
+    if scaler_path.exists():
+        shutil.copy2(scaler_path, run_dir / "scaler.pkl")
+
+    # Build loaders
+    train_loader, val_loader = _make_loaders(
+        X_train, y_train, X_val, y_val, batch_size=config.batch_size
+    )
+
+    device = torch.device("cpu")
+    input_dim = X_train.shape[1]
+    num_classes = len(CLASS_NAMES)
+    model = MLPClassifier(
         input_dim=input_dim,
         num_classes=num_classes,
-        hidden_sizes=hidden,
-        dropout=args.dropout,
-        batchnorm=bool(args.batchnorm),
+        hidden_sizes=config.hidden_sizes,
+        dropout=config.dropout,
+        batchnorm=config.batchnorm,
     ).to(device)
 
-    # Optional class weights
-    weight_tensor = None
-    if args.class_weights:
-        cw = compute_class_weights(y_tr)
-        weight_tensor = torch.tensor(cw, dtype=torch.float32, device=device)
+    # Loss (optional class weights)
+    class_weights = None
+    if config.class_weights:
+        class_weights = compute_class_weights(y_train, num_classes=num_classes).to(device)
+    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.Adam(
+        model.parameters(), lr=config.lr, weight_decay=config.weight_decay
+    )
 
-    criterion = nn.CrossEntropyLoss(weight=weight_tensor)
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # Loggers
+    train_logger = CSVLogger(run_dir / "train_log.csv", ["epoch", "loss"])
+    val_logger = CSVLogger(run_dir / "val_log.csv", ["epoch", "accuracy", "macro_f1"])
 
-    # Logs
-    train_log = artifacts / "train_log.csv"
-    val_log = artifacts / "val_log.csv"
+    best_val_f1 = -1.0
+    best_epoch = -1
+    epochs_no_improve = 0
+    best_state = None
 
-    best_f1 = -1.0
-    no_improve = 0
+    for epoch in range(1, config.epochs + 1):
+        model.train()
+        running_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            optimizer.zero_grad()
+            logits = model(xb)
+            loss = criterion(logits, yb)
+            loss.backward()
+            optimizer.step()
+            running_loss += float(loss.item()) * xb.size(0)
+        epoch_loss = running_loss / len(train_loader.dataset)
+        train_logger.log({"epoch": epoch, "loss": epoch_loss})
 
-    for epoch in range(1, args.epochs + 1):
-        tr_loss, tr_y, tr_yp = _epoch_step(model, train_loader, criterion, optimizer)
-        tr_metrics = compute_metrics(tr_y, tr_yp)
-        append_csv(
-            train_log,
-            {"epoch": epoch, "loss": tr_loss, **tr_metrics},
-            fieldnames_ordered=["epoch", "loss", "accuracy", "macro_f1", "micro_f1"],
-        )
+        # Validation
+        val_metrics = _evaluate(model, val_loader, device=device)
+        val_logger.log({"epoch": epoch, **val_metrics})
 
-        with torch.no_grad():
-            va_loss, va_y, va_yp = _epoch_step(model, val_loader, criterion, optimizer=None)
-            va_metrics = compute_metrics(va_y, va_yp)
-            append_csv(
-                val_log,
-                {"epoch": epoch, "loss": va_loss, **va_metrics},
-                fieldnames_ordered=["epoch", "loss", "accuracy", "macro_f1", "micro_f1"],
-            )
-
-        print(f"[epoch {epoch:03d}] "
-              f"train loss={tr_loss:.4f} macroF1={tr_metrics['macro_f1']:.4f} | "
-              f"val loss={va_loss:.4f} macroF1={va_metrics['macro_f1']:.4f}")
-
-        # Early stopping on val macro-F1
-        if va_metrics["macro_f1"] > best_f1:
-            best_f1 = va_metrics["macro_f1"]
-            torch.save(model.state_dict(), artifacts / "best.pt")
-            write_json(
-                artifacts / "best.json",
-                {
-                    "epoch": epoch,
-                    "val": va_metrics,
-                    "config": {
-                        "epochs": args.epochs,
-                        "batch_size": args.batch_size,
-                        "lr": args.lr,
-                        "weight_decay": args.weight_decay,
-                        "hidden_sizes": hidden,
-                        "dropout": args.dropout,
-                        "batchnorm": bool(args.batchnorm),
-                        "class_weights": bool(args.class_weights),
-                        "patience": args.patience,
-                        "seed": args.seed,
-                    },
-                    "artifacts_dir": str(artifacts),
-                },
-            )
-            # Save meta + scaler for evaluation
-            write_json(artifacts / "meta.json", {"feature_names": meta.feature_names, "class_names": meta.class_names})
-            try:
-                joblib.dump(joblib.load(scaler_cache_path), artifacts / "scaler.pkl")
-            except Exception as e:
-                print(f"[warn] could not copy scaler: {e}")
-            no_improve = 0
+        # Early stopping on macro-F1 (validation)
+        if val_metrics["macro_f1"] > best_val_f1:
+            best_val_f1 = val_metrics["macro_f1"]
+            best_epoch = epoch
+            best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+            torch.save(best_state, run_dir / "best.pt")
+            # Save best.json
+            best_payload = {
+                "model": "mlp",
+                "hidden_sizes": config.hidden_sizes,
+                "dropout": config.dropout,
+                "batchnorm": config.batchnorm,
+                "lr": config.lr,
+                "weight_decay": config.weight_decay,
+                "batch_size": config.batch_size,
+                "epochs": config.epochs,
+                "patience": config.patience,
+                "class_weights": config.class_weights,
+                "seed": config.seed,
+                "val_metrics": val_metrics,
+                "best_epoch": best_epoch,
+                "class_names": CLASS_NAMES,
+            }
+            save_json(best_payload, run_dir / "best.json")
+            epochs_no_improve = 0
         else:
-            no_improve += 1
-            if no_improve >= args.patience:
-                print(f"[early stop] no improvement in {args.patience} epochs.")
-                break
+            epochs_no_improve += 1
 
-    print(f"[train] Best val macro-F1: {best_f1:.4f}. Checkpoint at {artifacts/'best.pt'}")
-    print(f"[artifacts] Directory: {artifacts}")
+        print(
+            f"[epoch {epoch:03d}] loss={epoch_loss:.4f} "
+            f"val_macroF1={val_metrics['macro_f1']:.4f} "
+            f"(best={best_val_f1:.4f} @ {best_epoch})"
+        )
+        if epochs_no_improve >= config.patience:
+            print(f"Early stopping after {epoch} epochs (no improvement for {config.patience}).")
+            break
+
+    train_logger.close()
+    val_logger.close()
+
+    # Ensure best.pt exists
+    if best_state is None:
+        best_state = {k: v.cpu() for k, v in model.state_dict().items()}
+        torch.save(best_state, run_dir / "best.pt")
+
+    # Return best validation metrics
+    best_json = json.loads((run_dir / "best.json").read_text())
+    return best_json["val_metrics"], run_dir
+
+
+def parse_hidden_sizes(arg: str) -> List[int]:
+    return [int(x.strip()) for x in arg.split(",") if x.strip()]
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Train MLP on Wine White (5-class) with early stopping on val macro-F1",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    parser.add_argument("--hidden-sizes", type=str, default="256,256,256")
+    parser.add_argument("--dropout", type=float, default=0.2)
+    parser.add_argument("--batchnorm", action="store_true")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--patience", type=int, default=8)
+    parser.add_argument("--class-weights", action="store_true")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default=None,
+        help="Where to store artifacts (default: artifacts/wine_white/<timestamp>_mlp_seed<seed>)",
+    )
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Directory containing winequality-white.csv (defaults to ./.cache/wine_white/)",
+    )
+    args = parser.parse_args()
+
+    cfg = TrainConfig(
+        hidden_sizes=parse_hidden_sizes(args.hidden_sizes),
+        dropout=args.dropout,
+        batchnorm=args.batchnorm,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        weight_decay=args.weight_decay,
+        patience=args.patience,
+        class_weights=args.class_weights,
+        seed=args.seed,
+        data_dir=args.data_dir,
+    )
+    metrics, run_dir = run_training(cfg, artifacts_dir=Path(args.artifacts_dir) if args.artifacts_dir else None)
+    print("[train] Best validation metrics:", metrics)
+    print(f"[train] Artifacts saved to: {run_dir}")
 
 
 if __name__ == "__main__":
-    train_main()
+    main()

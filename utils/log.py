@@ -1,32 +1,36 @@
-#!/usr/bin/env python3
-"""Simple JSON and CSV logging helpers."""
-
+# utils/log.py
 from __future__ import annotations
 
 import csv
 from pathlib import Path
-from typing import Dict, Iterable, Optional
-
-from .io import write_json
+from typing import Dict, Iterable, List, Optional
 
 
-def log_json(path: Path | str, obj: dict) -> None:
-    write_json(path, obj)
-
-
-def append_csv(
-    path: Path | str, dict_row: Dict[str, object], fieldnames_ordered: Optional[Iterable[str]] = None
-) -> None:
+class CSVLogger:
     """
-    Append a row to a CSV file; create header if the file does not exist.
+    Minimal CSV logger. Writes header on first write if file does not exist.
     """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    if fieldnames_ordered is None:
-        fieldnames_ordered = list(dict_row.keys())
-    exists = path.exists()
-    with path.open("a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames_ordered)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(dict_row)
+
+    def __init__(self, path: Path | str, fieldnames: Iterable[str]):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fieldnames = list(fieldnames)
+        self._file = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.DictWriter(self._file, fieldnames=self.fieldnames)
+        self._writer.writeheader()
+
+    def log(self, row: Dict):
+        # Write only known keys; fill missing with blanks
+        cleaned = {k: row.get(k, "") for k in self.fieldnames}
+        self._writer.writerow(cleaned)
+        self._file.flush()
+
+    def close(self):
+        if not self._file.closed:
+            self._file.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.close()

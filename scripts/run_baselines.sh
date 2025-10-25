@@ -1,9 +1,18 @@
+# scripts/run_baseline.sh
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Ensure we're running from repo root when using Colab:
-# In Colab cell before this script: %cd /content/project && %env PYTHONPATH=/content/project
+# Robust repo-root detection
+SCRIPT_DIR="$( cd -- "$( dirname -- "${BASH_SOURCE[0]}" )" &> /dev/null && pwd )"
+REPO_ROOT="$( cd "$SCRIPT_DIR/.." && pwd )"
+cd "$REPO_ROOT"
 
-python baselines/classical.py --algo logreg
-python baselines/classical.py --algo knn --k 5
-python baselines/classical.py --algo gnb
+# Default artifacts dir
+ART_DIR="artifacts/wine_white/$(date +%Y%m%d-%H%M%S)_logreg_seed42"
+mkdir -p "$ART_DIR"
+
+python -u baselines/logreg.py \
+  --seed 42 \
+  --artifacts-dir "$ART_DIR"
+
+echo "Baseline artifacts in: $ART_DIR"

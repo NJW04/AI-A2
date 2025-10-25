@@ -1,36 +1,47 @@
-#!/usr/bin/env python3
-"""I/O helpers and canonical project paths (Colab-friendly)."""
-
+# utils/io.py
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
+
+import joblib
 
 
-def read_json(path: Path | str, default: Any = None) -> Any:
-    path = Path(path)
-    if not path.exists():
-        return default
-    with path.open("r", encoding="utf-8") as f:
-        return json.load(f)
+def ensure_dir(path: Path | str) -> Path:
+    p = Path(path)
+    p.mkdir(parents=True, exist_ok=True)
+    return p
 
 
-def write_json(path: Path | str, obj: Any) -> None:
+def save_json(obj: Dict[str, Any], path: Path | str):
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, sort_keys=True)
 
 
-def project_paths() -> Dict[str, Path]:
-    """
-    Returns canonical paths used across the repo.
-    Root is two levels up from this file (../..).
-    """
-    root = Path(__file__).resolve().parents[1]  # .../utils/ -> repo root
-    cache = root / ".cache"
-    artifacts = root / "artifacts"
-    cache.mkdir(exist_ok=True, parents=True)
-    artifacts.mkdir(exist_ok=True, parents=True)
-    return {"root": root, "cache": cache, "artifacts": artifacts}
+def read_json(path: Path | str) -> Dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_pickle(obj: Any, path: Path | str):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    joblib.dump(obj, path)
+
+
+def load_pickle(path: Path | str) -> Any:
+    return joblib.load(path)
+
+
+def timestamp() -> str:
+    return time.strftime("%Y%m%d-%H%M%S")
+
+
+def default_artifacts_dir(project: str, tag: Optional[str] = None, base: str = "artifacts") -> Path:
+    t = timestamp()
+    sub = f"{t}" + (f"_{tag}" if tag else "")
+    return ensure_dir(Path(base) / project / sub)

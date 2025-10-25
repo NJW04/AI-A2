@@ -1,118 +1,137 @@
-#!/usr/bin/env python3
-"""
-Evaluate a saved checkpoint on the TEST split only (Breast Cancer).
-
-Outputs to the provided artifacts directory:
-- metrics_test.json (accuracy, macro_f1, micro_f1, roc_auc)
-- confmat_test.png
-- predictions.csv (index,y_true,y_pred,y_prob_pos)
-
-Usage:
-  python eval.py --checkpoint artifacts/breast_cancer/<RUN>/best.pt --artifacts-dir artifacts/breast_cancer/<RUN>
-"""
+# eval.py
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import joblib
 import numpy as np
 import torch
-from sklearn.metrics import roc_auc_score
 from torch.utils.data import DataLoader, TensorDataset
 
-from data.breast_cancer import load_breast_cancer_csv, make_splits
-from data.transforms import to_torch_tensors
-from models.mlp import build_mlp
-from utils.io import read_json, write_json
+from data.wine_white import CLASS_NAMES, load_or_fetch_wine_white, make_splits, standardize
+from models.mlp import MLPClassifier
+from utils.io import ensure_dir, read_json, save_json
 from utils.metrics import compute_metrics, plot_confusion
 from utils.seed import set_seed
 
 
-def _load_test(artifacts_dir: Path, seed: int):
-    best = read_json(artifacts_dir / "best.json", default={})
-    meta = read_json(artifacts_dir / "meta.json", default={})
-    class_names = meta.get("class_names", ["benign", "malignant"])
-    config = best.get("config", {})
-    if "seed" in config:
-        seed = int(config["seed"])
+def _load_scaler(artifacts_dir: Path) -> object:
+    p = artifacts_dir / "scaler.pkl"
+    if not p.exists():
+        raise FileNotFoundError(
+            f"Expected scaler at {p}. Ensure you trained the model and copied scaler.pkl."
+        )
+    return joblib.load(p)
 
-    csv = load_breast_cancer_csv()
-    X_tr, y_tr, X_val, y_val, X_te, y_te, _ = make_splits(csv, seed=seed)
 
-    scaler_path = artifacts_dir / "scaler.pkl"
-    if not scaler_path.exists():
-        raise FileNotFoundError(f"Scaler not found at {scaler_path}. Did you run train.py?")
-    scaler = joblib.load(scaler_path)
-    X_te = scaler.transform(X_te)
+def _prepare_test(
+    artifacts_dir: Path, data_dir: str | None, seed: int
+) -> Tuple[np.ndarray, np.ndarray, Dict]:
+    df, meta = load_or_fetch_wine_white(data_dir=data_dir)
+    feature_names = meta["feature_names"]
+    splits = make_splits(df, seed=seed, data_dir=data_dir)
 
-    X_te_t, y_te_t = to_torch_tensors(X_te, y_te)
-    test_ds = TensorDataset(X_te_t, y_te_t)
-    return test_ds, y_te, class_names, config, X_te.shape[1], len(class_names)
+    X = df[feature_names].values
+    y = df["label_idx"].values
+
+    X_test = X[splits["test_idx"]]
+    y_test = y[splits["test_idx"]]
+
+    # Load scaler from artifacts (do not refit)
+    scaler = _load_scaler(artifacts_dir)
+    X_test_s = scaler.transform(X_test).astype("float32")
+    return X_test_s, y_test, meta
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained MLP on the Breast Cancer TEST set only.",
+        description="Evaluate a saved MLP checkpoint on Wine White TEST split.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt checkpoint.")
-    parser.add_argument("--artifacts-dir", type=str, required=True, help="Artifacts directory from training.")
-    parser.add_argument("--batch-size", type=int, default=256, help="Eval batch size.")
-    parser.add_argument("--seed", type=int, default=42, help="Seed used to create the splits (fallback).")
+    parser.add_argument("--checkpoint", type=str, required=True, help="Path to best.pt")
+    parser.add_argument(
+        "--artifacts-dir",
+        type=str,
+        default=None,
+        help="Artifacts directory containing scaler.pkl and best.json (defaults to checkpoint parent).",
+    )
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--data-dir",
+        type=str,
+        default=None,
+        help="Directory containing winequality-white.csv (defaults to ./.cache/wine_white/)",
+    )
     args = parser.parse_args()
 
     set_seed(args.seed)
-    artifacts_dir = Path(args.artifacts_dir)
-    ckpt = Path(args.checkpoint)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    test_ds, y_true, class_names, config, input_dim, num_classes = _load_test(artifacts_dir, args.seed)
+    checkpoint_path = Path(args.checkpoint)
+    run_dir = Path(args.artifacts_dir) if args.artifacts_dir else checkpoint_path.parent
+    ensure_dir(run_dir)
 
-    # Build model from training config
-    hidden = config.get("hidden_sizes", [256, 256, 256])
-    if isinstance(hidden, str):
-        hidden = [int(x) for x in hidden.split(",")]
-    dropout = float(config.get("dropout", 0.2))
-    batchnorm = bool(config.get("batchnorm", True))
+    # Load config from best.json
+    best_json_path = run_dir / "best.json"
+    if not best_json_path.exists():
+        raise FileNotFoundError(f"Missing {best_json_path}.")
+    best_cfg = read_json(best_json_path)
 
-    model = build_mlp(input_dim, num_classes, hidden, dropout, batchnorm).to(device)
-    state = torch.load(ckpt, map_location=device)
+    # Prepare data (test only)
+    X_test, y_test, meta = _prepare_test(run_dir, args.data_dir, args.seed)
+
+    device = torch.device("cpu")
+    input_dim = X_test.shape[1]
+    num_classes = len(CLASS_NAMES)
+    hidden_sizes = best_cfg.get("hidden_sizes", [256, 256, 256])
+    dropout = float(best_cfg.get("dropout", 0.2))
+    batchnorm = bool(best_cfg.get("batchnorm", False))
+
+    model = MLPClassifier(
+        input_dim=input_dim,
+        num_classes=num_classes,
+        hidden_sizes=hidden_sizes,
+        dropout=dropout,
+        batchnorm=batchnorm,
+    ).to(device)
+
+    state = torch.load(checkpoint_path, map_location="cpu")
     model.load_state_dict(state)
     model.eval()
 
-    loader = DataLoader(test_ds, batch_size=args.batch_size, shuffle=False, num_workers=0)
-    ys, yps, prob_pos = [], [], []
-    softmax = torch.nn.Softmax(dim=1)
+    # Predict on test
+    Xte_t = torch.from_numpy(X_test.astype("float32"))
+    dtest = TensorDataset(Xte_t, torch.from_numpy(y_test.astype("int64")))
+    loader = DataLoader(dtest, batch_size=128, shuffle=False)
+
+    preds, probs, labels = [], [], []
     with torch.no_grad():
         for xb, yb in loader:
-            xb = xb.to(device)
-            logits = model(xb)
-            probs = softmax(logits).cpu().numpy()
-            yp = logits.argmax(dim=1).cpu().numpy()
-            ys.append(yb.numpy())
-            yps.append(yp)
-            prob_pos.extend(probs[:, 1].tolist())
+            logits = model(xb.to(device))
+            p = torch.softmax(logits, dim=1).cpu().numpy()
+            preds.append(np.argmax(p, axis=1))
+            probs.append(p)
+            labels.append(yb.numpy())
 
-    y_true_np = np.concatenate(ys)
-    y_pred_np = np.concatenate(yps)
-    metrics = compute_metrics(y_true_np, y_pred_np)
+    y_pred = np.concatenate(preds)
+    y_true = np.concatenate(labels)
+    prob_arr = np.concatenate(probs)
 
-    roc_auc = float(roc_auc_score(y_true_np, np.array(prob_pos)))
-    metrics["roc_auc"] = roc_auc
-    write_json(artifacts_dir / "metrics_test.json", metrics)
-    print("[eval] TEST metrics:", metrics)
+    # Save predictions/probabilities
+    out_preds = run_dir / "predictions.csv"
+    out_probs = run_dir / "probs_5cols.csv"
+    np.savetxt(out_preds, np.c_[np.arange(len(y_true)), y_true, y_pred], delimiter=",", fmt="%d", header="index,y_true,y_pred", comments="")
+    np.savetxt(out_probs, prob_arr, delimiter=",", fmt="%.6f", header="very_low,low,medium,high,very_high", comments="")
 
-    labels = class_names
-    plot_confusion(y_true_np, y_pred_np, labels, artifacts_dir / "confmat_test.png")
+    # Metrics + confusion matrix
+    metrics = compute_metrics(y_true, y_pred)
+    save_json(metrics, run_dir / "metrics_test.json")
+    plot_confusion(y_true, y_pred, labels=CLASS_NAMES, out_path=run_dir / "confmat_test.png")
 
-    pred_out = artifacts_dir / "predictions.csv"
-    with pred_out.open("w") as f:
-        f.write("index,y_true,y_pred,y_prob_pos\n")
-        for i, (yt, yp, pp) in enumerate(zip(y_true_np.tolist(), y_pred_np.tolist(), prob_pos)):
-            f.write(f"{i},{yt},{yp},{pp}\n")
-    print(f"[eval] Wrote predictions to {pred_out}")
+    print("[eval] Test metrics:", metrics)
+    print(f"[eval] Saved {out_preds}, {out_probs}, and confmat_test.png at: {run_dir}")
 
 
 if __name__ == "__main__":

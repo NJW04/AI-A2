@@ -1,31 +1,24 @@
-#!/usr/bin/env python3
-"""Tabular transforms and utilities for Dry Bean."""
-
+# data/transforms.py
 from __future__ import annotations
+
 from typing import Tuple
 
 import numpy as np
 import torch
-from sklearn.utils.class_weight import compute_class_weight
 
 
-def compute_class_weights(y_train: np.ndarray) -> np.ndarray:
+def compute_class_weights(y: np.ndarray, num_classes: int) -> torch.Tensor:
     """
-    Compute class weights using sklearn's 'balanced' logic.
-    Returns a float32 numpy array of shape (num_classes,).
+    Compute balanced class weights: n_samples / (n_classes * count_c)
+    Returns torch.float32 tensor of shape [num_classes].
     """
-    classes = np.unique(y_train)
-    weights = compute_class_weight(class_weight="balanced", classes=classes, y=y_train)
-    return weights.astype(np.float32)
+    counts = np.bincount(y, minlength=num_classes).astype(float)
+    total = counts.sum()
+    weights = total / (num_classes * np.maximum(counts, 1.0))
+    # Normalize to mean=1 for numerical stability
+    weights = weights * (num_classes / weights.sum())
+    return torch.tensor(weights, dtype=torch.float32)
 
 
-def to_torch_tensors(
-    X: np.ndarray, y: np.ndarray
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """
-    Convert numpy arrays to torch tensors with correct dtype.
-    X -> float32, y -> int64
-    """
-    X_t = torch.tensor(X, dtype=torch.float32)
-    y_t = torch.tensor(y, dtype=torch.long)
-    return X_t, y_t
+def to_tensor(x: np.ndarray, y: np.ndarray) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.from_numpy(x.astype("float32")), torch.from_numpy(y.astype("int64"))

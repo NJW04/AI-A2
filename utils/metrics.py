@@ -1,6 +1,4 @@
-#!/usr/bin/env python3
-"""Metrics utilities: accuracy, F1, and confusion matrix plotting."""
-
+# utils/metrics.py
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,31 +6,36 @@ from typing import Dict, List
 
 import matplotlib.pyplot as plt
 import numpy as np
-from sklearn.metrics import ConfusionMatrixDisplay, accuracy_score, f1_score
+from sklearn.metrics import (
+    ConfusionMatrixDisplay,
+    accuracy_score,
+    confusion_matrix,
+    f1_score,
+    recall_score,
+)
 
 
-def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """
-    Compute accuracy, macro-F1, micro-F1.
-    """
-    acc = accuracy_score(y_true, y_pred)
-    macro = f1_score(y_true, y_pred, average="macro")
-    micro = f1_score(y_true, y_pred, average="micro")
-    return {"accuracy": float(acc), "macro_f1": float(macro), "micro_f1": float(micro)}
+def compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict:
+    accuracy = float(accuracy_score(y_true, y_pred))
+    macro_f1 = float(f1_score(y_true, y_pred, average="macro"))
+    per_class_recall = recall_score(y_true, y_pred, average=None).astype(float).tolist()
+    return {
+        "accuracy": accuracy,
+        "macro_f1": macro_f1,
+        "per_class_recall": per_class_recall,
+    }
 
 
-def plot_confusion(y_true: np.ndarray, y_pred: np.ndarray, labels: List[str], out_path: Path | str) -> Path:
-    """
-    Save a confusion matrix PNG using matplotlib.
-    """
+def plot_confusion(
+    y_true: np.ndarray, y_pred: np.ndarray, labels: List[str], out_path: Path | str
+):
+    cm = confusion_matrix(y_true, y_pred, labels=list(range(len(labels))))
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=labels)
+    fig, ax = plt.subplots(figsize=(6, 6), dpi=150)
+    disp.plot(ax=ax, cmap="Blues", colorbar=True)
+    plt.title("Confusion Matrix (Test)")
+    plt.tight_layout()
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    fig, ax = plt.subplots(figsize=(7, 6), dpi=120)
-    ConfusionMatrixDisplay.from_predictions(
-        y_true=y_true, y_pred=y_pred, display_labels=labels, xticks_rotation=45, ax=ax, colorbar=False
-    )
-    ax.set_title("Confusion Matrix")
-    fig.tight_layout()
-    fig.savefig(out_path, bbox_inches="tight")
+    plt.savefig(out_path)
     plt.close(fig)
-    return out_path
